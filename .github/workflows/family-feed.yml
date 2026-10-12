@@ -1,0 +1,81 @@
+# 갓모 식구들 파일(family/v1.json · v2.json)을 하루 한 번 다시 만든다 — 설계·운영 절차: 갓모 저장소 docs/backend/FAMILY.md 7절
+#
+# 켜고 끄기: 저장소 변수 FAMILY_FEED_ENABLED 가 'true' 일 때만 예약 실행된다(끄려면 변수를 지우거나 false로).
+#            손으로 돌리는 Run workflow 는 변수와 상관없이 되고, 기본이 dry_run(쓰지 않고 결과만 보여 줌)이다.
+# 필요한 것: 비밀 TELEMETRYDECK_TOKEN(필수), 변수 FAMILY_EXCLUDE(선택 — 제외할 기기 앞 8자, 쉼표로 구분)
+# 실패하면: 파일을 건드리지 않아 어제 파일이 남고, 실행이 실패로 표시되며, 'family-feed-failed' 이슈가 열린다(다음 성공 때 닫힘).
+name: Family feed
+
+on:
+  schedule:
+    - cron: '30 16 * * *'   # 매일 01:30 KST(UTC 16:30) — 어제까지 최근 30일
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '쓰지 않고 결과만 보기'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: family-feed
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.event_name == 'workflow_dispatch' || vars.FAMILY_FEED_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 스크립트 검사
+        run: python3 -m unittest discover -s tests
+
+      - name: 파일 만들기
+        env:
+          TELEMETRYDECK_TOKEN: ${{ secrets.TELEMETRYDECK_TOKEN }}
+          FAMILY_EXCLUDE: ${{ vars.FAMILY_EXCLUDE }}
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then
+            python3 scripts/family_feed.py --dry-run
+          else
+            python3 scripts/family_feed.py
+          fi
+
+      - name: 올리기
+        if: env.DRY_RUN != 'true'
+        run: |
+          git config user.name "godmo-family-feed"
+          git config user.email "actions@users.noreply.github.com"
+          git add family/v1.json family/v2.json
+          if git diff --cached --quiet; then echo "바뀐 것 없음"; else
+            git commit -m "식구들 파일 갱신 $(date -u +%F)"
+            git push
+          fi
+
+      - name: 지난 실패 이슈 닫기
+        if: success() && env.DRY_RUN != 'true'
+        run: |
+          for n in $(gh issue list --label family-feed-failed --state open --json number --jq '.[].number'); do
+            gh issue close "$n" --comment "성공했다($(date -u +%F)) — 닫는다"
+          done
+
+      - name: 실패 표시(이슈)
+        if: failure() && github.event_name == 'schedule'
+        run: |
+          gh label create family-feed-failed --color B60205 --description "식구들 파일 갱신 실패" 2>/dev/null || true
+          url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          n=$(gh issue list --label family-feed-failed --state open --json number --jq '.[0].number // empty')
+          if [ -z "$n" ]; then
+            gh issue create --title "식구들 파일 갱신 실패" --label family-feed-failed \
+              --body "자동 갱신이 실패했다. 어제 파일이 그대로 남아 있다. 실행 기록: $url — 절차는 갓모 저장소 docs/backend/FAMILY.md 7절."
+          else
+            gh issue comment "$n" --body "또 실패했다($(date -u +%F)): $url"
+          fi
